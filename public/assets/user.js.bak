@@ -1,0 +1,956 @@
+const form = document.querySelector("#generateForm");
+const button = document.querySelector("#generateButton");
+const queueButton = document.querySelector("#queueButton");
+const message = document.querySelector("#generateMessage");
+const stage = document.querySelector("#previewStage");
+const downloadLink = document.querySelector("#downloadLink");
+const historyList = document.querySelector("#historyList");
+const csrfToken = document.querySelector('input[name="csrf_token"]')?.value || "";
+const modeInputs = document.querySelectorAll('input[name="mode"]');
+const editUpload = document.querySelector("[data-edit-upload]");
+const editImagesInput = document.querySelector('input[name="edit_images[]"]');
+const editPreview = document.querySelector("[data-edit-preview]");
+const editUploadHint = document.querySelector("[data-edit-upload-hint]");
+
+let isGenerating = false;
+let viewerZoom = 1;
+let viewerNaturalWidth = 0;
+let viewerNaturalHeight = 0;
+let editSelectedFiles = [];
+
+const showMessage = (text, type = "success") => {
+  try {
+    window.showToast?.(text, type);
+  } catch (_) { /* ignore */ }
+  if (message) {
+    message.textContent = "";
+    message.className = "inline-message hidden";
+  }
+};
+
+const setGenerating = (enabled, mode = "generate") => {
+  isGenerating = enabled;
+  if (button) {
+    button.disabled = enabled;
+    button.textContent = enabled && mode === "generate" ? "鍦ㄧ嚎生成中.." : "立即在线生成";
+  }
+  if (queueButton) {
+    queueButton.disabled = enabled;
+    queueButton.textContent = enabled && mode === "queue" ? "正在放入后台..." : "放入后台生成";
+  }
+};
+
+const setPreviewLoading = () => {
+  if (!stage || !downloadLink) return;
+  downloadLink.classList.add("hidden");
+  stage.innerHTML = `
+    <div class="preview-loading">
+      <div class="preview-spinner" aria-hidden="true"></div>
+      <strong>图片生成中</strong>
+      <span>请求正在处理中紝完成鍚庝細鍦ㄨ繖閲屾樉绀虹粨鏋溿€?/span>
+    </div>
+  `;
+};
+
+const setPreviewQueued = () => {
+  if (!stage || !downloadLink) return;
+  downloadLink.classList.add("hidden");
+  stage.innerHTML = `
+    <div class="empty-state">
+      <strong>任务已入队/strong>
+      <span>后台 Worker 会继续生成，完成后可在生成记录中查看。/span>
+    </div>
+  `;
+};
+
+const setPreviewProcessing = () => {
+  if (!stage || !downloadLink) return;
+  downloadLink.classList.add("hidden");
+  stage.innerHTML = `
+    <div class="preview-loading">
+      <div class="preview-spinner" aria-hidden="true"></div>
+      <strong>正在生成图片</strong>
+      <span>AI 姝ｅ湪鍒涗綔涓紝结果浼氳嚜鍔ㄦ樉绀哄湪杩欓噷銆?/span>
+    </div>
+  `;
+};
+const setPreview = (src, format = "png", isVideo = false) => {
+  if (!stage || !downloadLink) return;
+  stage.innerHTML = "";
+
+  if (isVideo) {
+    const video = document.createElement("video");
+    video.src = src;
+    video.controls = true;
+    video.autoplay = true;
+    video.loop = false;
+    video.style.maxWidth = "100%";
+    video.style.maxHeight = "60vh";
+    stage.appendChild(video);
+    downloadLink.href = src;
+    downloadLink.download = `generated-video.${format}`;
+    downloadLink.classList.remove("hidden");
+    return;
+  }
+
+  const image = document.createElement("img");
+  image.src = src;
+  image.alt = "生成图片";
+  stage.appendChild(image);
+  downloadLink.href = src;
+  downloadLink.download = `generated-image.${format}`;
+  downloadLink.classList.remove("hidden");
+};
+
+const setPreviewError = (text) => {
+  if (!stage || !downloadLink) return;
+  downloadLink.classList.add("hidden");
+  stage.innerHTML = `
+    <div class="preview-error">
+      <strong>生成失败</strong>
+      <span>${escapeHtml(text)}</span>
+    </div>
+  `;
+};
+
+const escapeHtml = (value) =>
+  String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+
+const statusText = (status) =>
+  ({
+    queued: "排队中,
+    running: "生成中,
+    succeeded: "已完成,
+    failed: "澶辫触",
+    deleted: "已删除,
+  }[status] || status || "-");
+
+const getBalanceLabel = () =>
+  document.querySelector("[data-balance-display]")?.dataset.balanceLabel || "浣欓";
+
+const updateCredits = (credits) => {
+  if (credits === undefined || credits === null) return;
+  document.querySelectorAll("[data-balance-display]").forEach((node) => {
+    const label = node.dataset.balanceLabel || "浣欓";
+    node.textContent = `${label} ${Number(credits)}`;
+  });
+};
+
+const createRecordCard = (record) => {
+  const article = document.createElement("article");
+  article.className = "record-card";
+  article.tabIndex = 0;
+  article.dataset.recordId = record.id || "";
+  article.dataset.status = record.status || "succeeded";
+  article.dataset.mode = record.mode || "draw";
+  article.dataset.prompt = record.prompt || "";
+  article.dataset.size = record.size || "auto";
+  article.dataset.quality = record.quality || "auto";
+  article.dataset.format = record.format || "png";
+  article.dataset.credits = String(record.credits_charged ?? 0);
+  article.dataset.created = record.created_at || "";
+  article.dataset.finished = record.finished_at || "-";
+  article.dataset.error = record.error_message || "";
+  article.dataset.inputCount = String(record.input_image_count || 0);
+
+  const isVideo = (record.mode || '') === 'video';
+  let mediaContent;
+  if (isVideo) {
+    mediaContent = record.video_src
+      ? `<video src="${escapeHtml(record.video_src)}" controls style="max-width:100%;max-height:200px;"></video>`
+      : `<span>${escapeHtml(statusText(record.status || "failed"))}</span>`;
+  } else {
+    mediaContent = record.image_src
+      ? `<img src="${escapeHtml(record.image_src)}" alt="生成图片">`
+      : `<span>${escapeHtml(statusText(record.status || "failed"))}</span>`;
+  }
+
+  article.innerHTML = `
+    <div class="record-image">${mediaContent}</div>
+    <div class="record-body">
+      <div class="record-meta">
+        <span>${escapeHtml(statusText(record.status || "succeeded"))}</span>
+        <span>${ (record.mode || '') === 'video' ? "视频鐢熸垚" : (record.mode || "draw") === "edit" ? "编辑" : "绘画"} / ${escapeHtml(record.size || "auto")} / ${ (record.mode || '') === 'video' ? escapeHtml(record.format || "mp4") : escapeHtml(record.quality || "auto")}</span>
+      </div>
+      <p>${escapeHtml(record.prompt || "")}</p>
+      <div class="record-foot">
+        <time>${escapeHtml(record.created_at || "")}</time>
+        <button type="button" class="record-delete" data-delete-record>鍒犻櫎</button>
+      </div>
+    </div>
+  `;
+  return article;
+};
+
+const prependLatestRecord = (record) => {
+  if (!historyList || !record) return;
+  historyList.querySelector(".history-empty-inline")?.remove();
+  historyList.prepend(createRecordCard(record));
+
+  if (form) {
+    const cards = historyList.querySelectorAll(".record-card");
+    cards.forEach((card, index) => {
+      if (index >= 5) card.remove();
+    });
+  }
+};
+
+const closeRecordDialog = () => {
+  document.querySelector("#recordDialog")?.classList.add("hidden");
+  document.body.classList.remove("has-dialog");
+};
+
+const closeImageViewer = () => {
+  document.querySelector("#imageViewer")?.classList.add("hidden");
+};
+
+const syncEditInputFiles = () => {
+  if (!editImagesInput || typeof DataTransfer === "undefined") return;
+  const transfer = new DataTransfer();
+  editSelectedFiles.forEach((file) => transfer.items.add(file));
+  editImagesInput.files = transfer.files;
+};
+
+const fileKey = (file) => `${file.name}-${file.size}-${file.lastModified}`;
+
+const renderEditPreview = () => {
+  if (editUploadHint) {
+    const max = Number(editImagesInput?.dataset.maxFiles || 1);
+    editUploadHint.textContent = editSelectedFiles.length
+      ? `宸查€夋嫨 ${editSelectedFiles.length} / ${max} 寮狅紝可户缁坊鍔燻
+      : "鏀寔 PNG / JPG / WEBP锛屽彲澶氭閫夋嫨";
+  }
+  if (!editPreview) return;
+  editPreview.innerHTML = "";
+  if (!editSelectedFiles.length) {
+    editPreview.classList.add("hidden");
+    return;
+  }
+  editPreview.classList.remove("hidden");
+  editSelectedFiles.forEach((file, index) => {
+    const item = document.createElement("div");
+    item.className = "edit-preview-item";
+    const image = document.createElement("img");
+    image.alt = file.name;
+    image.src = URL.createObjectURL(file);
+    image.addEventListener("load", () => URL.revokeObjectURL(image.src), { once: true });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "鍒犻櫎";
+    remove.dataset.removeEditImage = String(index);
+    item.appendChild(image);
+    item.appendChild(remove);
+    editPreview.appendChild(item);
+  });
+};
+
+const resetEditImages = () => {
+  editSelectedFiles = [];
+  if (editImagesInput) editImagesInput.value = "";
+  renderEditPreview();
+  syncEditInputFiles();
+};
+
+const getViewerNodes = () => {
+  const viewer = ensureImageViewer();
+  return {
+    viewer,
+    stage: viewer.querySelector("[data-viewer-stage]"),
+    image: viewer.querySelector("[data-viewer-image]"),
+    zoomText: viewer.querySelector("[data-viewer-zoom]"),
+  };
+};
+
+const applyViewerZoom = (zoom, shouldCenter = true) => {
+  const { stage, image, zoomText } = getViewerNodes();
+  if (!viewerNaturalWidth || !viewerNaturalHeight) return;
+
+  const previousCenterX = stage.scrollLeft + stage.clientWidth / 2;
+  const previousCenterY = stage.scrollTop + stage.clientHeight / 2;
+  const previousZoom = viewerZoom || 1;
+
+  viewerZoom = Math.min(6, Math.max(0.1, zoom));
+  image.style.width = `${Math.round(viewerNaturalWidth * viewerZoom)}px`;
+  image.style.height = `${Math.round(viewerNaturalHeight * viewerZoom)}px`;
+  zoomText.textContent = `${Math.round(viewerZoom * 100)}%`;
+
+  if (shouldCenter) {
+    const ratio = viewerZoom / previousZoom;
+    stage.scrollLeft = previousCenterX * ratio - stage.clientWidth / 2;
+    stage.scrollTop = previousCenterY * ratio - stage.clientHeight / 2;
+  }
+};
+
+const fitImageToViewer = () => {
+  const { stage, image } = getViewerNodes();
+  if (!image.naturalWidth || !image.naturalHeight) return;
+
+  viewerNaturalWidth = image.naturalWidth;
+  viewerNaturalHeight = image.naturalHeight;
+  const fitZoom = Math.min(
+    stage.clientWidth / viewerNaturalWidth,
+    stage.clientHeight / viewerNaturalHeight,
+    1
+  );
+  applyViewerZoom(fitZoom || 1, false);
+  stage.scrollLeft = Math.max(0, (image.clientWidth - stage.clientWidth) / 2);
+  stage.scrollTop = Math.max(0, (image.clientHeight - stage.clientHeight) / 2);
+};
+
+const ensureImageViewer = () => {
+  let viewer = document.querySelector("#imageViewer");
+  if (viewer) return viewer;
+
+  viewer = document.createElement("div");
+  viewer.id = "imageViewer";
+  viewer.className = "image-viewer hidden";
+  viewer.innerHTML = `
+    <div class="image-viewer-toolbar" role="toolbar" aria-label="鍥剧墖查看宸ュ叿">
+      <button type="button" data-zoom-out>缩小</button>
+      <button type="button" data-zoom-in>放大</button>
+      <button type="button" data-zoom-fit>适合</button>
+      <button type="button" data-zoom-one>100%</button>
+      <span data-viewer-zoom>100%</span>
+      <button type="button" data-close-image>关闭</button>
+    </div>
+    <div class="image-viewer-stage" data-viewer-stage>
+      <div class="image-viewer-canvas" data-viewer-canvas>
+        <img alt="放大查看生成图片" draggable="false" data-viewer-image>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(viewer);
+  viewer.addEventListener("click", (event) => {
+    if (event.target === viewer || event.target.closest("[data-close-image]")) {
+      closeImageViewer();
+    } else if (event.target.closest("[data-zoom-in]")) {
+      applyViewerZoom(viewerZoom * 1.25);
+    } else if (event.target.closest("[data-zoom-out]")) {
+      applyViewerZoom(viewerZoom / 1.25);
+    } else if (event.target.closest("[data-zoom-fit]")) {
+      fitImageToViewer();
+    } else if (event.target.closest("[data-zoom-one]")) {
+      applyViewerZoom(1);
+    }
+  });
+
+  const stage = viewer.querySelector("[data-viewer-stage]");
+  const image = viewer.querySelector("[data-viewer-image]");
+  const canvas = viewer.querySelector("[data-viewer-canvas]");
+  let dragStart = null;
+
+  image.addEventListener("load", fitImageToViewer);
+  stage.addEventListener("wheel", (event) => {
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    applyViewerZoom(event.deltaY < 0 ? viewerZoom * 1.12 : viewerZoom / 1.12);
+  }, { passive: false });
+  stage.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    if (event.target === canvas && stage.scrollWidth <= stage.clientWidth && stage.scrollHeight <= stage.clientHeight) return;
+    dragStart = {
+      x: event.clientX,
+      y: event.clientY,
+      left: stage.scrollLeft,
+      top: stage.scrollTop,
+    };
+    stage.setPointerCapture(event.pointerId);
+    stage.classList.add("is-dragging");
+  });
+  stage.addEventListener("pointermove", (event) => {
+    if (!dragStart) return;
+    stage.scrollLeft = dragStart.left - (event.clientX - dragStart.x);
+    stage.scrollTop = dragStart.top - (event.clientY - dragStart.y);
+  });
+  stage.addEventListener("pointerup", () => {
+    dragStart = null;
+    stage.classList.remove("is-dragging");
+  });
+  stage.addEventListener("pointercancel", () => {
+    dragStart = null;
+    stage.classList.remove("is-dragging");
+  });
+  return viewer;
+};
+
+const openImageViewer = (src) => {
+  if (!src) return;
+  const { viewer, image } = getViewerNodes();
+  viewerNaturalWidth = 0;
+  viewerNaturalHeight = 0;
+  viewerZoom = 1;
+  image.removeAttribute("style");
+  viewer.classList.remove("hidden");
+  image.src = src;
+  if (image.complete) {
+    requestAnimationFrame(fitImageToViewer);
+  }
+};
+
+const ensureRecordDialog = () => {
+  let dialog = document.querySelector("#recordDialog");
+  if (dialog) return dialog;
+
+  dialog = document.createElement("div");
+  dialog.id = "recordDialog";
+  dialog.className = "record-dialog hidden";
+  dialog.innerHTML = `
+    <div class="record-dialog-panel" role="dialog" aria-modal="true" aria-labelledby="recordDialogTitle">
+      <div class="record-dialog-head">
+        <div>
+          <p class="eyebrow">Record detail</p>
+          <h2 id="recordDialogTitle">鐢熸垚记录璇︽儏</h2>
+        </div>
+        <button type="button" class="dialog-close" data-close-record>关闭</button>
+      </div>
+      <div class="record-dialog-body">
+        <div class="record-full-prompt">
+          <span>瀹屾暣提示璇?/span>
+          <p data-dialog-prompt></p>
+        </div>
+        <div class="record-input-images hidden" data-dialog-inputs>
+          <span>鍙傝€冨浘鐗?/span>
+          <div data-dialog-input-list></div>
+        </div>
+        <div class="record-dialog-image" data-dialog-image></div>
+        <div class="record-detail-grid">
+          <div class="record-detail-status">
+            <span>状态/span>
+            <strong class="status" data-dialog-status>-</strong>
+          </div>
+          <div>
+            <span>参数</span>
+            <strong data-dialog-params>-</strong>
+          </div>
+          <div>
+            <span>娑堣€?{escapeHtml(getBalanceLabel())}</span>
+            <strong data-dialog-credits>-</strong>
+          </div>
+          <div class="record-detail-time">
+            <span>时间</span>
+            <strong data-dialog-time>-</strong>
+          </div>
+        </div>
+        <div class="record-error hidden" data-dialog-error></div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(dialog);
+
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog || event.target.closest("[data-close-record]")) {
+      closeRecordDialog();
+    }
+  });
+
+  return dialog;
+};
+
+const setText = (root, selector, value) => {
+  const node = root.querySelector(selector);
+  if (node) node.textContent = value || "-";
+};
+
+const formatDuration = (start, end) => {
+  if (!start || !end || end === "-") return "-";
+  const startedAt = new Date(String(start).replace(" ", "T")).getTime();
+  const finishedAt = new Date(String(end).replace(" ", "T")).getTime();
+  if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt) || finishedAt < startedAt) {
+    return "-";
+  }
+
+  const seconds = Math.round((finishedAt - startedAt) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const restSeconds = seconds % 60;
+  return `${minutes}m ${restSeconds}s`;
+};
+
+const openRecordDialog = (card) => {
+  const dialog = ensureRecordDialog();
+  const data = card.dataset;
+  const imageBox = dialog.querySelector("[data-dialog-image]");
+  const inputBox = dialog.querySelector("[data-dialog-inputs]");
+  const inputList = dialog.querySelector("[data-dialog-input-list]");
+  const errorBox = dialog.querySelector("[data-dialog-error]");
+  const imageSrc =
+    card.querySelector(".record-image video")?.getAttribute("src") ||
+    card.querySelector(".record-image img")?.getAttribute("src") ||
+    card.querySelector(".table-thumb img")?.getAttribute("src") ||
+    "";
+
+  if (imageBox) {
+    imageBox.innerHTML = "";
+    const isVideoDialog = data.mode === "video";
+    if (imageSrc) {
+      if (isVideoDialog) {
+        const video = document.createElement("video");
+        video.src = imageSrc;
+        video.controls = true;
+        video.style.maxWidth = "100%";
+        video.style.maxHeight = "400px";
+        imageBox.appendChild(video);
+      } else {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "record-dialog-image-button";
+        button.dataset.previewSrc = imageSrc;
+        button.title = "鐐瑰嚮放大查看";
+        const image = document.createElement("img");
+        image.src = imageSrc;
+        image.alt = "生成图片";
+        button.appendChild(image);
+        imageBox.appendChild(button);
+      }
+    } else {
+      const placeholder = document.createElement("span");
+      placeholder.textContent = data.status || "鏃犲浘鐗?;
+      imageBox.appendChild(placeholder);
+    }
+  }
+
+  if (inputBox && inputList) {
+    inputList.innerHTML = "";
+    const inputCount = Number(data.inputCount || 0);
+    if (data.mode === "edit" && inputCount > 0) {
+      inputBox.classList.remove("hidden");
+      for (let index = 0; index < inputCount; index += 1) {
+        const src = `/input_image?id=${encodeURIComponent(data.recordId || "")}&index=${index}`;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "record-input-image-button";
+        button.dataset.previewSrc = src;
+        button.title = "鐐瑰嚮放大查看鍙傝€冨浘";
+        const image = document.createElement("img");
+        image.src = src;
+        image.alt = `鍙傝€冨浘鐗?${index + 1}`;
+        button.appendChild(image);
+        inputList.appendChild(button);
+      }
+    } else {
+      inputBox.classList.add("hidden");
+    }
+  }
+
+  const statusNode = dialog.querySelector("[data-dialog-status]");
+  if (statusNode) {
+    statusNode.textContent = statusText(data.status);
+    statusNode.className = `status ${data.status || ""}`;
+  }
+  setText(dialog, "[data-dialog-params]", `${data.mode === "video" ? "视频鐢熸垚" : data.mode === "edit" ? "编辑" : "绘画"} / ${data.size || "auto"} / ${data.mode === "video" ? (data.format || "mp4") : (data.quality || "auto")}`);
+  setText(dialog, "[data-dialog-credits]", data.credits);
+  setText(
+    dialog,
+    "[data-dialog-time]",
+    `创建 ${data.created || "-"} / 完成 ${data.finished || "-"} / 耗时 ${formatDuration(data.created, data.finished)}`
+  );
+  setText(dialog, "[data-dialog-prompt]", data.prompt);
+
+  if (errorBox) {
+    if (data.error) {
+      errorBox.textContent = data.error;
+      errorBox.classList.remove("hidden");
+    } else {
+      errorBox.textContent = "";
+      errorBox.classList.add("hidden");
+    }
+  }
+
+  dialog.classList.remove("hidden");
+  document.body.classList.add("has-dialog");
+};
+
+/**
+ * 瀹夊叏鐨勭‘璁ゅ璇濇鍑芥暟
+ * 浼樺厛浣跨敤 JptLayer 寮圭獥锛屼笉可敤鏃堕檷绾т负娴忚鍣ㄥ師鐢?confirm()
+ */
+const safeConfirm = async (message, options = {}) => {
+  if (window.JptLayer && typeof window.JptLayer.confirm === "function") {
+    return window.JptLayer.confirm(message, options);
+  }
+  return window.confirm(message);
+};
+
+const deleteRecord = async (card) => {
+  const recordId = card?.dataset.recordId;
+  if (!recordId) return;
+
+  // 直接用浏览器原生 confirm锛屼笉渚濊禆 JptLayer
+  if (!window.confirm("纭鍒犻櫎杩欐潯鐢熸垚记录锛?)) return;
+
+  try {
+    const body = new FormData();
+    body.append("csrf_token", csrfToken);
+    body.append("record_id", recordId);
+
+    const response = await fetch("/delete_record", {
+      method: "POST",
+      headers: { "X-Requested-With": "fetch" },
+      body,
+    });
+    const data = await response.json();
+    if (!data.ok) {
+      window.alert(data.message || "鍒犻櫎澶辫触");
+      return;
+    }
+
+    card.remove();
+    if (historyList && !historyList.querySelector(".record-card")) {
+      historyList.innerHTML = '<div class="history-empty-inline">鏆傛棤鐢熸垚记录</div>';
+    }
+    // 鐢?JptLayer toast 提示鎴愬姛锛堝鏋滄湁锛夛紝鍚﹀垯涓嶆彁绀?    window.showToast?.("记录已删除, "success");
+  } catch (error) {
+    window.alert(error.message || "鍒犻櫎澶辫触锛岃閲嶈瘯");
+  }
+};
+
+const syncModeFields = () => {
+  const mode = document.querySelector('input[name="mode"]:checked')?.value || "draw";
+  if (!editUpload || !editImagesInput) return;
+  const isEdit = mode === "edit";
+  editUpload.classList.toggle("hidden", !isEdit);
+  editImagesInput.required = isEdit;
+  if (!isEdit) {
+    resetEditImages();
+  }
+
+  // 鍒囨崲娑堣€楁樉绀?  updateCostDisplay(mode);
+};
+
+/**
+ * 鏇存柊娑堣€楁樉绀猴紙鏍规嵁妯″紡鍜岄€変腑鐨勬ā鍨嬶級
+ */
+const updateCostDisplay = (mode) => {
+  const costDisplay = document.querySelector("[data-cost-display]");
+  const costValue = document.querySelector("[data-cost-value]");
+  const costEdit = document.querySelector("[data-cost-edit]");
+  if (!costDisplay || !costValue) return;
+
+  const isEdit = mode === "edit";
+  const drawCost = parseInt(costDisplay.dataset.drawCost) || 0;
+  const editCost = parseInt(costDisplay.dataset.editCost) || 0;
+
+  // 浠?data-image-models JSON 鏌ユ壘閫変腑妯″瀷鐨勮嚜瀹氫箟鐐规暟
+  const modelSelect = document.querySelector('select[name="ai_model_id"]');
+  let modelCredits = 0;
+  if (modelSelect) {
+    const models = (() => {
+      try { return JSON.parse(modelSelect.dataset.imageModels || "[]"); } catch (e) { return []; }
+    })();
+    const selectedId = parseInt(modelSelect.value) || 0;
+    const model = models.find((m) => m.id === selectedId);
+    if (model && model.credits > 0) modelCredits = model.credits;
+  }
+
+  if (modelCredits > 0) {
+    costValue.textContent = modelCredits;
+    costEdit?.classList.add("hidden");
+    return;
+  }
+
+  if (isEdit && costEdit) {
+    costValue.textContent = editCost;
+    costEdit.classList.remove("hidden");
+  } else {
+    costValue.textContent = drawCost;
+    costEdit?.classList.add("hidden");
+  }
+};
+
+modeInputs.forEach((input) => {
+  input.addEventListener("change", syncModeFields);
+});
+syncModeFields();
+
+// 妯″瀷鍒囨崲鏃舵洿鏂版秷鑰?document.querySelector('select[name="ai_model_id"]')?.addEventListener("change", () => {
+  const mode = document.querySelector('input[name="mode"]:checked')?.value || "draw";
+  updateCostDisplay(mode);
+});
+
+editImagesInput?.addEventListener("change", () => {
+  const max = Number(editImagesInput.dataset.maxFiles || 1);
+  const currentKeys = new Set(editSelectedFiles.map(fileKey));
+  Array.from(editImagesInput.files || []).forEach((file) => {
+    if (!currentKeys.has(fileKey(file))) {
+      editSelectedFiles.push(file);
+      currentKeys.add(fileKey(file));
+    }
+  });
+
+  if (editSelectedFiles.length > max) {
+    showMessage(`涓€娆℃渶澶氫笂浼?${max} 寮犲弬鑰冨浘鐗囥€俙, "error");
+    editSelectedFiles = editSelectedFiles.slice(0, max);
+  }
+  syncEditInputFiles();
+  renderEditPreview();
+});
+
+editPreview?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-remove-edit-image]");
+  if (!button) return;
+  const index = Number(button.dataset.removeEditImage);
+  editSelectedFiles.splice(index, 1);
+  syncEditInputFiles();
+  renderEditPreview();
+});
+
+form?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (isGenerating) return;
+
+  syncEditInputFiles();
+  const formData = new FormData(form);
+  const format = formData.get("output_format") || "png";
+
+  setGenerating(true, "generate");
+  setPreviewProcessing();
+  showMessage("正在提交生成任务...", "info");
+
+  try {
+    // 提交到异步生成端点    const response = await fetch("/generate_async", {
+      method: "POST",
+      body: formData,
+    });
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch (e) { data = null; }
+
+    if (!data || !data.ok || !data.record_id) {
+      throw new Error(data?.message || "提交失败");
+    }
+
+    const recordId = data.record_id;
+    if (data.credits !== undefined) updateCredits(data.credits);
+
+    showMessage("AI 正在生成图片，请稍候...", "info");
+
+    // 轮询等待结果（带指数退避）
+    let pollCount = 0;
+    const maxPolls = 60;
+    let finished = false;
+    let currentInterval = 1000;
+    const pollStartTime = Date.now();
+
+    // 鎸囨暟閫€閬匡細1s 鈫?1.5s 鈫?2.25s 鈫?... 鈫?鏈€澶?5s
+    const getNextInterval = () => {
+      const next = Math.min(currentInterval * 1.5, 5000);
+      currentInterval = next;
+      return next;
+    };
+
+    while (!finished && pollCount < maxPolls) {
+      const pollInterval = getNextInterval();
+      await new Promise((r) => setTimeout(r, Math.min(pollInterval, 5000)));
+      pollCount++;
+
+      const elapsed = Math.round((Date.now() - pollStartTime) / 1000);      try {
+        const pollResp = await fetch(`/check_record?id=${recordId}`);
+        const pollText = await pollResp.text();
+        let pollData;
+        try { pollData = JSON.parse(pollText); } catch (e) { pollData = null; }
+
+        if (!pollData || !pollData.ok) continue;
+
+        const recStatus = pollData.status || "running";
+
+        if (recStatus === "succeeded") {
+          finished = true;
+
+          // 记录鍒板巻鍙?          if (pollData.record) {
+            prependLatestRecord(pollData.record);
+          }
+          if (pollData.credits !== undefined) updateCredits(pollData.credits);
+
+          // 鍖哄垎鍥剧墖 / 视频
+          const isVideo = (pollData.record?.mode || "") === "video";
+          const src = isVideo
+            ? pollData.video_src
+            : pollData.image_src;
+
+          // 鏄剧ず结果
+          if (src) {
+            setPreview(src, format, isVideo);
+            showMessage(isVideo ? "视频鐢熸垚完成锛? : "鍥剧墖鐢熸垚完成锛?, "success");
+          } else {
+            setPreviewError("鐢熸垚完成浣嗘病鏈夎繑鍥炲湴鍧€锛岃鍒锋柊查看銆?);
+            showMessage("宸茬敓鎴愶紝鍒锋柊查看銆?, "info");
+          }
+          break;
+        }
+
+        if (recStatus === "failed") {
+          finished = true;
+          const errMsg = pollData.record?.error_message || "生成失败锛岃閲嶈瘯";
+          setPreviewError(errMsg);
+          showMessage(errMsg, "error");
+
+          if (pollData.record) prependLatestRecord(pollData.record);
+          if (pollData.credits !== undefined) updateCredits(pollData.credits);
+          break;
+        }
+
+        // 杩樺湪鐢熸垚涓紝鏇存柊杩涘害提示
+        if (pollCount % 6 === 0) {
+          showMessage(`AI 姝ｅ湪鐢熸垚涓紙宸茬瓑寰?${elapsed} 绉掞級...`, "info");
+        }
+      } catch (e) {
+        // 杞鍑洪敊锛岀户缁皾璇?      }
+    }
+
+    if (!finished) {
+      setPreviewError("鐢熸垚瓒呮椂锛岃鍒锋柊页面查看记录涓槸鍚︽湁结果銆?);
+      showMessage("鐢熸垚耗时杈冮暱锛岃鍦ㄣ€岃褰曘€嶉〉闈㈡煡鐪嬬粨鏋溿€?, "warning");
+    }
+  } catch (error) {
+    setPreviewError(error.message);
+    showMessage(error.message, "error");
+  } finally {
+    setGenerating(false);
+  }
+});
+
+queueButton?.addEventListener("click", async () => {
+  if (!form || isGenerating) return;
+  if (!form.reportValidity()) return;
+
+  syncEditInputFiles();
+  const formData = new FormData(form);
+  setGenerating(true, "queue");
+  setPreviewQueued();
+  showMessage("姝ｅ湪放入后台生成...");
+
+  try {
+    const response = await fetch("/queue_generate", {
+      method: "POST",
+      body: formData,
+    });
+    const data = await response.json();
+
+    if (data.record) {
+      prependLatestRecord(data.record);
+    }
+    updateCredits(data.credits);
+
+    if (!response.ok || !data.ok) {
+      throw new Error(data.message || "鏀惧叆鍚庡彴生成失败");
+    }
+
+    showMessage(data.message || "宸叉斁鍏ュ悗鍙扮敓鎴愶紝璇峰湪鐢熸垚记录涓煡鐪嬭繘搴︺€?);
+  } catch (error) {
+    setPreviewError(error.message);
+    showMessage(error.message, "error");
+  } finally {
+    setGenerating(false);
+  }
+});
+
+window.addEventListener("beforeunload", (event) => {
+  if (!isGenerating) return;
+  event.preventDefault();
+  event.returnValue = "璇锋眰浠嶅湪澶勭悊涓紝关闭页面鍙兘瀵艰嚧褰撳墠鎻愪氦涓柇銆?;
+});
+
+historyList?.addEventListener("click", async (event) => {
+  // 濡傛灉鐐瑰嚮浜嗗垹闄よ〃鍗曞唴鐨勬寜閽紝涓嶆墦寮€记录瀵硅瘽妗?  if (event.target.closest(".record-delete-form, [data-delete-record]")) {
+    return;
+  }
+
+  const card = event.target.closest(".record-card");
+  if (!card) return;
+  openRecordDialog(card);
+});
+
+document.addEventListener("click", (event) => {
+  const previewButton = event.target.closest("[data-preview-src]");
+  if (!previewButton) return;
+  openImageViewer(previewButton.dataset.previewSrc);
+});
+
+historyList?.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const card = event.target.closest(".record-card");
+  if (!card || event.target.closest("[data-delete-record]")) return;
+  event.preventDefault();
+  openRecordDialog(card);
+});
+
+document.addEventListener("click", (event) => {
+  const openButton = event.target.closest("[data-open-record]");
+  if (!openButton) return;
+  const row = openButton.closest("[data-record-id]");
+  if (!row) return;
+  event.preventDefault();
+  openRecordDialog(row);
+});
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeImageViewer();
+    closeRecordDialog();
+  }
+});
+
+// ── Prompt Optimize ──
+const optimizeBtn = document.querySelector("#optimizePromptBtn");
+const promptTextarea = document.querySelector('textarea[name="prompt"]');
+const optimizeStatus = document.querySelector("#optimizePromptStatus");
+
+if (optimizeBtn && promptTextarea) {
+  optimizeBtn.addEventListener("click", async () => {
+    const raw = promptTextarea.value.trim();
+    if (!raw) {
+      if (optimizeStatus) {
+        optimizeStatus.textContent = "请先输入提示词";
+        optimizeStatus.className = "field-hint is-error";
+      }
+      promptTextarea.focus();
+      return;
+    }
+
+    optimizeBtn.classList.add("is-loading");
+    optimizeBtn.textContent = "优化中...";
+    if (optimizeStatus) {
+      optimizeStatus.textContent = "";
+      optimizeStatus.className = "field-hint hidden";
+    }
+
+    try {
+      const formData = new FormData();
+      formData.append("prompt", raw);
+      formData.append("csrf_token", csrfToken);
+
+      const res = await fetch("/prompt_optimize.php", {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await res.json();
+
+      if (data.ok && data.prompt) {
+        promptTextarea.value = data.prompt;
+        if (optimizeStatus) {
+          optimizeStatus.textContent = "优化完成";
+          optimizeStatus.className = "field-hint";
+        }
+        promptTextarea.style.height = "auto";
+        promptTextarea.style.height = promptTextarea.scrollHeight + "px";
+      } else {
+        throw new Error(data.message || "优化失败");
+      }
+    } catch (err) {
+      if (optimizeStatus) {
+        optimizeStatus.textContent = err.message || "优化请求失败，请稍后重试";
+        optimizeStatus.className = "field-hint is-error";
+      }
+      showMessage?.(err.message || "优化失败", "error");
+    } finally {
+      optimizeBtn.classList.remove("is-loading");
+      optimizeBtn.textContent = "+ 优化提示词";
+    }
+  });
+}
